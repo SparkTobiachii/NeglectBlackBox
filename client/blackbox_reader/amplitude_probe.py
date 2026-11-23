@@ -14,6 +14,7 @@ Besides the file it also follows the newest VRChat log (`output_log_*.txt`, read
 world NAME, which sets a marker "(auto)"), leaving a room, `Unpacking Avatar (Name by Creator)` (avatar name + creator), and that somebody joined / left
 (only COUNTED, the names are never read, so the report can say how many players the log saw next to a batch of IDs). The report
 then shows one timeline of log lines, markers and IDs, so every ID can be compared with the avatars the log says were loaded. `--no-log` turns that off. With VRChat started with the debug option `--enable-sdk-log-levels --log-debug-levels=API` it also notes the lines `[API] Requesting Get avatars/<id>` (live avatar IDs in the log, if VRChat writes them for other players: the test for the "spawn" idea).
+`--structure` also lists which KEYS the file has and what kind of value each holds (never a value), so you can see what VRChat keeps in it without reading it yourself.
 Report: `amplitude_probe_report.txt` next to the script (only avtr_ IDs, counts and timestamps - check it before you send it).
 IDs are masked by default (`avtr_1a2b3c4d-...`); `--full-ids` shows them whole, which you need to look them up.
 
@@ -78,6 +79,46 @@ def extract_avatar_ids_ordered(data: bytes) -> list[str]:
 def count_other_ids(data: bytes) -> dict[str, int]:
     """How many distinct usr_ / wrld_ / file_ / grp_ IDs are in the file - only the NUMBERS, never the IDs."""
     return {kind: len({m.group(0).lower() for m in rx.finditer(data)}) for kind, rx in OTHER_RES.items()}
+
+
+def structure_of(data: bytes, max_depth: int = 6) -> dict:
+    """What the file is made of, WITHOUT its content: the key paths with the kind of value (str / number / bool / list / object / null) and how often each occurs,
+    plus the NAMES of the events (the value of `event_type`, a label like `world_join`, not data about a person). Values are never returned. Tries the whole file as
+    JSON, then line by line; anything else gives an empty answer."""
+    import json
+
+    docs: list = []
+    text = data.decode("utf-16-le", "replace") if detect_encoding(data).startswith("UTF-16") else data.decode("utf-8", "replace")
+    try:
+        docs.append(json.loads(text))
+    except ValueError:
+        for ln in text.splitlines():
+            try:
+                docs.append(json.loads(ln))
+            except ValueError:
+                continue
+    paths: dict[str, dict] = {}
+    names: dict[str, int] = {}
+
+    def walk(node, path: str, depth: int) -> None:
+        kind = "object" if isinstance(node, dict) else "list" if isinstance(node, list) else "bool" if isinstance(node, bool) else "number" if isinstance(node, (int, float)) else "null" if node is None else "text"
+        entry = paths.setdefault(path or "(top)", {"kind": set(), "count": 0})
+        entry["kind"].add(kind)
+        entry["count"] += 1
+        if depth >= max_depth:
+            return
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if k == "event_type" and isinstance(v, str):
+                    names[v[:60]] = names.get(v[:60], 0) + 1
+                walk(v, f"{path}.{str(k)[:40]}" if path else str(k)[:40], depth + 1)
+        elif isinstance(node, list):
+            for v in node[:200]:
+                walk(v, f"{path}[]", depth + 1)
+
+    for d in docs:
+        walk(d, "", 0)
+    return {"paths": {k: {"kind": "/".join(sorted(v["kind"])), "count": v["count"]} for k, v in sorted(paths.items())}, "events": dict(sorted(names.items(), key=lambda kv: -kv[1]))}
 
 
 def detect_encoding(data: bytes) -> str:
@@ -195,6 +236,9 @@ class Probe:
         self.locked = 0
         self.encoding = ""
         self.others: dict[str, int] = {}
+        self.others_biggest: dict[str, int] = {}  # the same, taken from the snapshot with the most IDs (the last one is usually the cleared, empty file)
+        self.structure_on = False
+        self.structure: dict = {"paths": {}, "events": {}}
         self.lines: list[str] = []
         self.timeline: list[tuple[float, str]] = []  # (epoch, text): markers, IDs seen in the file, log lines
         self.room_players = 0  # joins minus leaves counted in the log since the room was entered (numbers only)
@@ -240,6 +284,9 @@ class Probe:
         ordered = extract_avatar_ids_ordered(data)
         if len(ordered) > len(self.biggest):
             self.biggest = ordered
+            self.others_biggest = count_other_ids(data)
+            if self.structure_on:
+                self.structure = structure_of(data)
         ids = extract_avatar_ids(data)
         now = self.clock()
         fresh = [i for i in ids if i not in self.previous]
@@ -302,6 +349,12 @@ class Probe:
         out.append(f"watched for {self.clock() - self.t0:.0f} s, last size {max(self.size, 0)} bytes, encoding {self.encoding or 'unknown'}, locked reads {self.locked}")
         out.append("how the file changed: " + (", ".join(f"{k} x{n}" for k, n in sorted(self.changes.items())) or "no look at all"))
         out.append("other ID kinds in the last snapshot (numbers only): " + ", ".join(f"{k} {n}" for k, n in self.others.items()))
+        out.append("other ID kinds in the LARGEST snapshot (numbers only; usr = people, wrld = worlds, file, grp = groups): " + (", ".join(f"{k} {n}" for k, n in self.others_biggest.items()) or "no snapshot with IDs"))
+        if self.structure_on:
+            out += ["", "STRUCTURE of the largest snapshot (key names and kinds of value only, never a value; event names are labels):"]
+            out += [f"    {path}  [{info['kind']}] x{info['count']}" for path, info in list(self.structure["paths"].items())[:300]] or ["    (the file is not JSON, or it was empty)"]
+            if self.structure["events"]:
+                out += ["", "EVENT NAMES (how often): " + ", ".join(f"{k} x{n}" for k, n in list(self.structure["events"].items())[:60])]
         out.append(f"distinct avatar IDs seen: {len(self.ever)}")
         out.append(f"API avatar request lines in the log (needs VRChat started with --log-debug-levels=API): {self.api_ids}")
         out.append("verdict: " + self.verdict())
@@ -346,8 +399,9 @@ def run_once(path: Path, full: bool) -> int:
     return 0
 
 
-def run_watch(path: Path, minutes: float, full: bool, follow_log: bool = True) -> int:
+def run_watch(path: Path, minutes: float, full: bool, follow_log: bool = True, structure: bool = False) -> int:
     probe = Probe(full)
+    probe.structure_on = structure
     tail = LogTail(log_folder()) if follow_log else None
     print(f"Watching {path} for {minutes:g} minutes. Join a public instance, stay a few minutes, then switch the world once.")
     print("Optional: type a note (e.g. the player count) + Enter to set a marker. Ctrl+C ends it and writes the report.\n")
@@ -381,12 +435,13 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--full-ids", action="store_true", help="print avatar IDs whole instead of masked")
         p.add_argument("--file", type=Path, help="another path than %%TEMP%%\\VRChat\\VRChat\\amplitude.cache")
     watch.add_argument("--minutes", type=float, default=20)
+    watch.add_argument("--structure", action="store_true", help="also report which keys the file has (names and kinds only, never a value): what kind of data VRChat keeps in it")
     watch.add_argument("--no-log", action="store_true", help="do not follow the VRChat log (no automatic room markers, no avatar lines)")
     args = ap.parse_args(argv)
     path = args.file or amplitude_path()
     if args.cmd == "once":
         return run_once(path, args.full_ids)
-    return run_watch(path, args.minutes, args.full_ids, not args.no_log)
+    return run_watch(path, args.minutes, args.full_ids, not args.no_log, args.structure)
 
 
 if __name__ == "__main__":
