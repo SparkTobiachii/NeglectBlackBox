@@ -276,7 +276,8 @@ class BlackBoxWindow:
                 if what == "show":
                     self.show()
                 elif what == "toggle":
-                    self.hide() if self.root.state() == "normal" else self.show()
+                    # hide only while the window is really in front: a window that sits behind another program must come forward, not vanish (that took two key presses)
+                    self.hide() if self.root.state() == "normal" and self.root.focus_displayof() is not None else self.show()
         except queue.Empty:
             pass
         if not self.control.quit.is_set():
