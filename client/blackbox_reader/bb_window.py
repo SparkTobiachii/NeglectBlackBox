@@ -76,6 +76,9 @@ def status_rows(snap: dict) -> list[tuple[str, str, str]]:
         rows.append(("Room", f"{snap['room']}" + (" (recorded)" if snap.get("tracked") else " (not a Neglect instance: nothing is sent)"), "ok" if snap.get("tracked") else "plain"))
     else:
         rows.append(("Room", "waiting for an instance", "plain"))
+    if snap.get("ids_allowed"):  # the DEV owner switched the feature on; it stays off until the person does too
+        on = bool(snap.get("avatar_ids"))
+        rows.append(("Avatar IDs", "on: only the avatar IDs VRChat loaded are read from its analytics file and sent" if on else "off (you can switch it on)", "ok" if on else "plain"))
     rows.append(("Events sent", str(snap.get("sent", 0)), "plain"))
     newest = snap.get("newest")
     rows.append(("Version", f"{snap.get('version', '?')}" + (f"  (newest: {newest})" if newest and newest != snap.get("version") else ""), "plain"))
@@ -210,7 +213,7 @@ class BlackBoxWindow:
 
         card = tk.Frame(root, bg=WINE, highlightbackground=LINE, highlightthickness=1)
         card.pack(fill="x", padx=22)
-        for _ in range(5):
+        for _ in range(6):
             row = tk.Frame(card, bg=WINE)
             row.pack(fill="x", padx=14, pady=5)
             label = tk.Label(row, text="", bg=WINE, fg=MUTED, font=("Segoe UI", 10), width=11, anchor="w")
@@ -227,6 +230,9 @@ class BlackBoxWindow:
         self.stop_button = self._button(tk, buttons, "Stop logging", self._toggle_logging, primary=True)
         self.stop_button.pack(side="left", expand=True, fill="x", padx=(0, 6))
         self._button(tk, buttons, "Check for updates", self.control.ask_for_updates).pack(side="left", expand=True, fill="x", padx=(6, 0))
+        self.ids_row = tk.Frame(root, bg=BG)  # only shown while the DEV owner has switched avatar IDs on (see _refresh)
+        self.ids_button = self._button(tk, self.ids_row, "Read avatar IDs", self._toggle_ids)
+        self.ids_button.pack(fill="x")
 
         foot = tk.Frame(root, bg=BG)
         foot.pack(fill="x", padx=24, pady=(14, 0))
@@ -243,6 +249,10 @@ class BlackBoxWindow:
         button.bind("<Enter>", lambda _e: button.configure(bg=hover))
         button.bind("<Leave>", lambda _e: button.configure(bg=bg))
         return button
+
+    def _toggle_ids(self) -> None:
+        self.control.set_avatar_ids(not self.control.avatar_ids)
+        self._refresh(again=False)
 
     def _toggle_logging(self) -> None:
         self.control.set_paused(not self.control.paused)
@@ -295,6 +305,11 @@ class BlackBoxWindow:
             value.configure(text="")
         self.message.configure(text=snap.get("message", ""))
         self.stop_button.configure(text="Start logging" if snap.get("paused") else "Stop logging")
+        if snap.get("ids_allowed"):
+            self.ids_button.configure(text="Stop reading avatar IDs" if snap.get("avatar_ids") else "Read avatar IDs")
+            self.ids_row.pack(fill="x", padx=22, pady=(8, 0), after=self.stop_button.master)
+        else:
+            self.ids_row.pack_forget()
         key = hotkey_label(self.control.hotkey)
         self.hint.configure(text=(f"{key} shows or hides this window. The X only hides it: the logger keeps running." if self.hotkey_ok
                                   else f"{key} is used by another program. Open this window with the Neglect Black Box entry in the Start menu."))

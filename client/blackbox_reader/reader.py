@@ -21,6 +21,7 @@ import platform
 import secrets
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -45,7 +46,7 @@ except ImportError:  # started from another folder (tests, tools): the module si
     except ImportError:
         ui = None  # type: ignore[assignment]  # the window is optional (and only exists on Windows)
 
-VERSION = "0.4.5"
+VERSION = "0.5.0"
 UPDATE_PREFIXES = ("https://github.com/SparkTobiachii/NeglectBotDashboard/releases/download/", "https://github.com/SparkTobiachii/NeglectBot/releases/download/")
 UPDATE_PREFIX = UPDATE_PREFIXES[0]  # an update is only ever fetched from our own GitHub releases ...
 UPDATE_FROM_BOT = "bot"  # ... or from the bot itself (the repository is private: the bot serves the installer, signed like every other request)
@@ -55,6 +56,9 @@ DEFAULT_SERVER = "https://crm.neglect404.org"
 BATCH = 200
 QUEUE_MAX = 5000  # events kept while the server cannot be reached
 HEARTBEAT = 30.0
+IDS_WINDOW = 120.0  # seconds after a room change in which the list of avatar IDs VRChat writes belongs to the room that was left
+IDS_MAX_FILE = 16 * 1024 * 1024  # a bigger analytics file is not read at all (the real one is small)
+IDS_RETRY_MAX = 400
 log = logging.getLogger("blackbox")
 
 
@@ -76,6 +80,49 @@ def vrchat_log_dir() -> Path:
 def newest_log(folder: Path) -> Path | None:
     files = sorted(folder.glob("output_log_*.txt"), key=lambda p: p.stat().st_mtime)
     return files[-1] if files else None
+
+
+def amplitude_cache_path() -> Path:
+    """VRChat's analytics buffer `%TEMP%\\VRChat\\VRChat\\amplitude.cache`. Besides personal data of the person it holds the IDs of the avatars the game loaded."""
+    return Path(os.environ.get("TEMP") or os.environ.get("TMP") or tempfile.gettempdir()) / "VRChat" / "VRChat" / "amplitude.cache"
+
+
+class AmplitudeTail:
+    """Looks at the analytics file for avatar IDs - and ONLY for those: `poll` returns the avatar IDs that were not in the file before, nothing else of the file is kept,
+    logged or sent. The first look after `reset` only learns what is already there (history is never sent). A file that did not change is not read (stat only)."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.seen: set[str] | None = None  # None = not learned yet
+        self.stamp: tuple[int, float] | None = None
+
+    def reset(self) -> None:
+        self.seen, self.stamp = None, None
+
+    def poll(self) -> list[str]:
+        try:
+            st = self.path.stat()
+        except OSError:
+            return []
+        if self.stamp == (st.st_size, st.st_mtime):
+            return []
+        self.stamp = (st.st_size, st.st_mtime)
+        if st.st_size > IDS_MAX_FILE:
+            return []
+        try:
+            data = self.path.read_bytes()
+        except OSError:
+            self.stamp = None  # locked by VRChat right now: look again next time
+            return []
+        ids = bp.avatar_ids_from(data)
+        if self.seen is None:
+            self.seen = set(ids)
+            return []
+        fresh = [i for i in ids if i not in self.seen]
+        self.seen.update(fresh)
+        if len(self.seen) > 5000:  # the file is cleared by VRChat from time to time; this is only a safety net
+            self.seen = set(ids)
+        return fresh
 
 
 # ---------------------------------------------------------------- key protection (Windows DPAPI; elsewhere the file is just not world readable)
@@ -148,6 +195,8 @@ class Identity:
 
 # ---------------------------------------------------------------- talking to the bot
 class Api:
+    ids_state: bool | None = None
+
     def __init__(self, identity: Identity):
         self.id = identity
         self.key = None
@@ -207,6 +256,8 @@ class Api:
         body: dict = {"loc": loc, "version": VERSION}
         if debug is not None:
             body["debug"] = debug
+        if self.ids_state is not None:
+            body["avatar_ids"] = self.ids_state  # does this PC read avatar IDs right now (for the Devices tab)
         return self._call("/bb/v1/hello", body)
 
     def send(self, events: list[dict]) -> dict:
@@ -239,6 +290,14 @@ class Reader:
         self.count = 0
         self.sent = 0  # events the bot has accepted since this program started
         self.log_name = ""
+        self.ids_allowed = False  # the DEV owner's switch, as the bot answered it
+        self.ids_on = False  # both switches (the person's and the DEV owner's) are on right now: set by the loop
+        self.room_ids: set[str] = set()  # IDs from the log already handed on in this room
+        self.prev_loc, self.prev_track = "", False  # the room that was left last (and whether it was tracked)
+        self.entered_at = self.left_at = 0.0
+        self.ids_sent = 0
+        self.id_retry: list[dict] = []
+        self.last_id_try = 0.0
 
     def start_replay(self, log_name: str) -> None:
         self.log_name, self.replaying = log_name, True
@@ -255,9 +314,17 @@ class Reader:
         self.count += 1
         ev["eid"] = hashlib.sha256(f"{self.device}|{self.log_name}|{self.count}".encode()).hexdigest()[:20]
         kind = ev["kind"]
+        if kind == "avatar_id":  # from the debug log: only while avatar IDs are switched on (both sides), once per room
+            if not self.ids_on or self.replaying or ev["data"].get("id") in self.room_ids:
+                return
+            self.room_ids.add(ev["data"].get("id"))
         if kind == "room_enter":
+            self.room_ids.clear()
             self.queue.clear()  # an older room that was never flushed is not interesting
+            if self.loc:  # no OnLeftRoom line came: the room is left now
+                self.prev_loc, self.prev_track, self.left_at = self.loc, self.track is True, time.time()
             self.loc = ev["loc"]
+            self.entered_at = time.time()
             self.track = None
             self.queue.append(ev)
             if not self.replaying:
@@ -269,6 +336,7 @@ class Reader:
         if kind == "room_leave":
             if not self.replaying:
                 self.flush()
+            self.prev_loc, self.prev_track, self.left_at = self.loc, self.track is True, time.time()
             self.loc, self.track = "", False
             if self.replaying:
                 self.queue.clear()
@@ -277,6 +345,7 @@ class Reader:
         try:
             answer = self.api.hello(self.loc)
             self.track = bool(answer.get("track"))
+            self.ids_allowed = bool(answer.get("avatar_ids"))
             self.last_hello = time.time()
         except Exception as e:
             self.track = None
@@ -306,15 +375,60 @@ class Reader:
             self.ask()
             if self.track:
                 self.flush()
+        self.retry_ids(now)
 
     def stop_recording(self) -> None:
         """VRChat closed or crashed: say so and forget the room."""
         if self.loc and self.track:
             self.queue.append({"ts": time.time(), "kind": "room_leave", "loc": self.loc, "data": {"reason": "closed"}, "eid": secrets.token_hex(8)})
             self.flush()
+        if self.loc:
+            self.prev_loc, self.prev_track, self.left_at = self.loc, self.track is True, time.time()
         self.loc, self.track = "", False
         self.queue.clear()
         self.parser.reset_room()
+
+    # ------------------------------------------------ avatar IDs (opt-in on both sides, see `AmplitudeTail`)
+    def id_room(self, now: float) -> str:
+        """The room new avatar IDs belong to. VRChat writes the list of the avatars it loaded when the room CHANGES, a little after the new room was entered, so for IDs
+        that arrive within IDS_WINDOW of a room change it is the room that was left (only when that one was tracked); later it is the room the person is in
+        (an avatar switched on by hand is written at once). Anything else (an untracked room, no room) belongs nowhere: nothing is sent."""
+        if self.loc and now - self.entered_at >= IDS_WINDOW:
+            return self.loc if self.track is True else ""
+        if self.prev_track and now - (self.entered_at if self.loc else self.left_at) <= IDS_WINDOW:
+            return self.prev_loc
+        return ""
+
+    def feed_ids(self, ids: list[str], now: float | None = None) -> int:
+        """Send avatar IDs, each as its own `avatar_id` event of the room they belong to. Returns how many were handed to the bot. Not while a log is being replayed."""
+        now = time.time() if now is None else now
+        loc = self.id_room(now)
+        if not ids or not loc or self.replaying:
+            return 0
+        events = [{"ts": now, "kind": "avatar_id", "loc": loc, "data": {"id": i}, "eid": hashlib.sha256(f"{self.device}|avtr|{loc}|{i}".encode()).hexdigest()[:20]} for i in ids if bp.AVTR_RE.match(i)]
+        return self._send_ids(events + self.id_retry, now)
+
+    def _send_ids(self, events: list[dict], now: float) -> int:
+        self.id_retry = []
+        done = 0
+        for n in range(0, len(events), BATCH):
+            batch = events[n:n + BATCH]
+            try:
+                self.api.send(batch)
+            except Exception as e:
+                log.info("avatar IDs not sent: %s", e)
+                self.id_retry = events[n:][-IDS_RETRY_MAX:]
+                self.last_id_try = now
+                break
+            done += len(batch)
+        self.ids_sent += done
+        self.sent += done
+        return done
+
+    def retry_ids(self, now: float) -> None:
+        if self.id_retry and now - self.last_id_try >= HEARTBEAT:
+            self.last_id_try = now
+            self._send_ids(list(self.id_retry), now)
 
 
 # ---------------------------------------------------------------- VRChat start options: a desktop shortcut (debug logging only works at the START of the game)
@@ -358,7 +472,7 @@ class Control:
             self.cfg = {}
         self.check_now = threading.Event()
         self.quit = threading.Event()
-        self.status: dict = {"version": VERSION, "paused": self.paused, "message": ""}
+        self.status: dict = {"version": VERSION, "paused": self.paused, "message": "", "avatar_ids": self.avatar_ids, "ids_allowed": False}
 
     @property
     def paused(self) -> bool:
@@ -367,6 +481,18 @@ class Control:
     @property
     def hotkey(self) -> str:
         return str(self.cfg.get("hotkey") or "ctrl+shift+n")
+
+    @property
+    def avatar_ids(self) -> bool:
+        """The person's own switch for reading avatar IDs (default OFF; it only works while the DEV owner has switched it on for everybody as well)."""
+        return bool(self.cfg.get("avatar_ids"))
+
+    def set_avatar_ids(self, value: bool) -> None:
+        with self.lock:
+            self.cfg["avatar_ids"] = bool(value)
+            self.status["avatar_ids"] = bool(value)
+            self._save()
+        log.info("avatar IDs %s by the person", "switched on" if value else "switched off")
 
     def _save(self) -> None:
         try:
@@ -517,6 +643,9 @@ def check_in(api: Api, identity: Identity, reader: Reader, state: dict, folder: 
     if answer.get("min_version") and version_tuple(answer["min_version"]) > version_tuple(VERSION):
         log.warning("this reader (%s) is older than the minimum %s: not sending", VERSION, answer["min_version"])
         reader.track = False
+    reader.ids_allowed = bool(answer.get("avatar_ids"))
+    if control is not None:
+        control.update(ids_allowed=reader.ids_allowed)
     if "launch_args" in answer:
         try:
             sync_launch_shortcut(str(answer["launch_args"] or ""))
@@ -540,6 +669,7 @@ def run_loop(identity: Identity, opened: bool = False, control: Control | None =
     control = control or Control(folder)
     api = Api(identity)
     reader = Reader(api, identity.cfg["device_id"])
+    tail = AmplitudeTail(amplitude_cache_path())
     state: dict = {"opened": opened}
     log_dir = vrchat_log_dir()
     current: Path | None = None
@@ -552,6 +682,8 @@ def run_loop(identity: Identity, opened: bool = False, control: Control | None =
         try:
             now = time.time()
             if control.paused:  # "Stop logging": nothing is read and nothing is sent until the person resumes
+                tail.reset()
+                api.ids_state = reader.ids_on = False
                 if not was_paused:
                     was_paused = True
                     reader.stop_recording()
@@ -585,6 +717,12 @@ def run_loop(identity: Identity, opened: bool = False, control: Control | None =
                 if got:
                     reader.flush()
             reader.heartbeat(now)
+            reading = control.avatar_ids and reader.ids_allowed  # both switches: the person's and the DEV owner's, both default OFF
+            api.ids_state = reader.ids_on = reading
+            if reading:
+                reader.feed_ids(tail.poll())
+            else:
+                tail.reset()  # off: the file is not even opened, and what is in it later is "history", not news
             if control.check_now.is_set():
                 control.check_now.clear()
                 last_check = now

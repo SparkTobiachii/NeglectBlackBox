@@ -25,6 +25,7 @@ Event = {"ts": unix seconds, "kind": str, "loc": location or "", "data": {...}}.
   security     data: on (bool)                                                         ([Players] OnSecurityEnabledChanged(True))
   avatar_load  data: avatar, author                                                   (`[AssetBundleDownloadManager] [n] Unpacking Avatar (Name by Author)`: an avatar was loaded, with its creator; no usr_ in the line)
   room_state   data: room, clogged (bool)                                              ([Room] Bedroom 3 OnDeserialization - IsClogged = True, only when it changed)
+  avatar_id    data: id (avtr_...)                                                     (the reader takes it from VRChat's amplitude.cache with `avatar_ids_from` and - with the debug log - from the line `[API] Requesting Get avatars/<id>`; the reader sends it only when the person and the DEV owner both switched avatar IDs on)
 """
 
 from __future__ import annotations
@@ -32,6 +33,11 @@ from __future__ import annotations
 import re
 from datetime import datetime
 
+AVTR_RE = re.compile(r"^avtr_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")  # the form every avatar ID must have (lower case) before it is used or stored
+_AVTR_FIND = re.compile(rb"avtr_[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+_AVTR_FIND16 = re.compile(  # the same text as UTF-16LE: every character followed by a zero byte
+    rb"a\x00v\x00t\x00r\x00_\x00(?:[0-9a-fA-F]\x00){8}-\x00(?:[0-9a-fA-F]\x00){4}-\x00(?:[0-9a-fA-F]\x00){4}-\x00(?:[0-9a-fA-F]\x00){4}-\x00(?:[0-9a-fA-F]\x00){12}")
+AVATAR_IDS_MAX = 400  # one look at the file never yields more than this
 LINE_TS = re.compile(r"^(\d{4})\.(\d\d)\.(\d\d) (\d\d):(\d\d):(\d\d) ")
 USR = r"(usr_[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
 RE_AUTH = re.compile(r"User Authenticated: (.+) \(" + USR + r"\)\s*$")
@@ -52,6 +58,7 @@ RE_VIPHOST = re.compile(r"\[MyInstance\] Setting VIPHost to (.+?)\s*$")
 RE_VIP = re.compile(r"\[MyInstance\] ActivateVipInstance\s*$")
 RE_PURCHASE = re.compile(r"OnPurchaseConfirmed - but (.+?) doesn't have")
 RE_SECURITY = re.compile(r"\[Players\] OnSecurityEnabledChanged\((True|False)\)")
+RE_API_AVATAR = re.compile(r"\[API\] Requesting Get avatars/(avtr_[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})")
 RE_UNPACK = re.compile(r"\[AssetBundleDownloadManager\] \[\d+\] Unpacking Avatar \((.+)\)\s*$")
 RE_POSTLOGIN = re.compile(r"post login checks for (.+) \(" + USR + r"\)\s*$")  # newer VRChat versions: no `User Authenticated` line any more
 RE_CONFIG = re.compile(r"\[Behaviour\] Configuring (local|remote) player VRCPlayer\[\w+\] \d+ (\d+)\s*$")
@@ -195,6 +202,9 @@ class LogParser:
             return []
         if "[Behaviour]" in line:
             return self._behaviour(ts, line)
+        if "Requesting Get avatars/" in line:  # only with the debug log (VRChat started with --log-debug-levels=API); the format is taken from reports of other tools, not seen here yet
+            m = RE_API_AVATAR.search(line)
+            return [self._ev(ts, "avatar_id", id=m.group(1).lower())] if m and self.in_room else []
         if "Unpacking Avatar" in line:
             m = RE_UNPACK.search(line)
             if m and self.in_room:
@@ -445,3 +455,16 @@ def parse_lines(lines, tz=None) -> list[dict]:
     for line in lines:
         out.extend(p.feed(line))
     return out
+
+
+def avatar_ids_from(data: bytes, limit: int = AVATAR_IDS_MAX) -> list[str]:
+    """The avatar IDs (`avtr_<uuid>`) in a chunk of bytes (plain text and UTF-16LE), lower case, each once, in the order they stand in the data.
+    ONLY the matched strings are returned: nothing around them (the file next to them holds personal data of the person who wears the log) is looked at or kept."""
+    hits = [(m.start(), m.group(0).decode("ascii")) for m in _AVTR_FIND.finditer(data)]
+    hits += [(m.start(), m.group(0).decode("utf-16-le")) for m in _AVTR_FIND16.finditer(data)]
+    found: dict[str, None] = {}
+    for _, text in sorted(hits):
+        found.setdefault(text.lower(), None)
+        if len(found) >= limit:
+            break
+    return list(found)
