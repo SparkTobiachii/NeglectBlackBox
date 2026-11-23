@@ -45,7 +45,7 @@ except ImportError:  # started from another folder (tests, tools): the module si
     except ImportError:
         ui = None  # type: ignore[assignment]  # the window is optional (and only exists on Windows)
 
-VERSION = "0.4.2"
+VERSION = "0.4.3"
 UPDATE_PREFIXES = ("https://github.com/SparkTobiachii/NeglectBotDashboard/releases/download/", "https://github.com/SparkTobiachii/NeglectBot/releases/download/")
 UPDATE_PREFIX = UPDATE_PREFIXES[0]  # an update is only ever fetched from our own GitHub releases ...
 UPDATE_FROM_BOT = "bot"  # ... or from the bot itself (the repository is private: the bot serves the installer, signed like every other request)
@@ -441,6 +441,14 @@ def download_update(latest: dict, folder: Path, api: Api | None = None) -> Path 
     return target
 
 
+def fresh_env() -> dict[str, str]:
+    """The environment for the installer, which starts the NEW exe: a PyInstaller exe that inherits `_MEIPASS2` / `_PYI_*` from this one reuses this program's temp folder
+    (which is deleted when this process ends) and fails with "Failed to load Python DLL ...\\_MEIxxxx\\python313.dll"."""
+    env = {k: v for k, v in os.environ.items() if not (k.startswith("_MEI") or k.startswith("_PYI") or k == "_MEIPASS2")}
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"  # PyInstaller 6.9+: "this is a fresh start, not a re-launch of the parent"
+    return env
+
+
 def apply_update(latest: dict, folder: Path, api: Api | None = None) -> bool:
     """Download, check and start the installer (silent; it replaces this program and starts the new one). Ends the whole process when the installer runs."""
     try:
@@ -451,7 +459,7 @@ def apply_update(latest: dict, folder: Path, api: Api | None = None) -> bool:
     if installer is None:
         return False
     log.info("starting the installer of version %s", latest["version"])
-    subprocess.Popen([str(installer), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"], creationflags=0x00000008 if sys.platform == "win32" else 0)  # noqa: S603
+    subprocess.Popen([str(installer), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"], creationflags=0x00000008 if sys.platform == "win32" else 0, env=fresh_env())  # noqa: S603
     os._exit(0)  # a thread cannot end the program with sys.exit; the installer closes anything that is left
 
 
