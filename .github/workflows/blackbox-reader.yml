@@ -1,0 +1,88 @@
+name: Black Box reader (Windows)
+
+# Builds the hidden logger for the staff PCs on a Windows runner: one exe (the Python runtime is bundled, nobody needs Python), a per-user installer
+# with autostart, and a SHA-256 for both. It starts by itself when the reader code changes on main or by hand (Actions > Run workflow). Every new VERSION in
+# client/blackbox_reader/reader.py becomes a GitHub release `blackbox-v<version>` (installer + SHA256SUMS.txt). This repository is public, so the bot finds the
+# release by itself (no secret), checks the SHA-256 and offers it to every PC, and the PCs install it by themselves.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ["client/blackbox_reader/**", "neglect/blackbox_parse.py", ".github/workflows/blackbox-reader.yml"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install build tools
+        run: python -m pip install --upgrade pip pyinstaller pynacl
+
+      - name: Read the version
+        id: ver
+        shell: bash
+        run: echo "version=$(grep -oP '^VERSION = "\K[^"]+' client/blackbox_reader/reader.py)" >> "$GITHUB_OUTPUT"
+
+      - name: Self test of the Python source (before it is packed)
+        timeout-minutes: 3
+        run: python client/blackbox_reader/reader.py selftest && type "$env:APPDATA\NeglectBlackBox\selftest.txt"
+
+      - name: Build the exe (windowless)
+        run: >
+          pyinstaller --onefile --noconsole --name NeglectBlackBox
+          --icon client/blackbox_reader/assets/logo.ico
+          --add-data "client/blackbox_reader/assets;assets"
+          --paths neglect --paths client/blackbox_reader --hidden-import blackbox_parse --hidden-import bb_window
+          --hidden-import tkinter --hidden-import tkinter.messagebox
+          --hidden-import _cffi_backend --collect-all nacl
+          client/blackbox_reader/reader.py
+
+      - name: Self test of the finished exe
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          Remove-Item "$env:APPDATA\NeglectBlackBox\selftest.txt", "$env:APPDATA\NeglectBlackBox\crash.txt" -ErrorAction SilentlyContinue
+          $p = Start-Process -FilePath dist\NeglectBlackBox.exe -ArgumentList "selftest" -PassThru
+          if (-not $p.WaitForExit(90000)) { $p.Kill(); Write-Host "the exe did not finish in 90 s (a dialog or a hang)" }
+          foreach ($f in "selftest.txt", "crash.txt", "reader.log") { $path = Join-Path "$env:APPDATA\NeglectBlackBox" $f; if (Test-Path $path) { Write-Host "--- $f"; Get-Content $path } }
+          if (-not $p.HasExited -or $p.ExitCode -ne 0) { throw "selftest of the exe failed" }
+
+      - name: Build the installer
+        run: |
+          choco install innosetup -y --no-progress
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DAppVersion=${{ steps.ver.outputs.version }} client\blackbox_reader\installer.iss
+
+      - name: SHA-256
+        shell: pwsh
+        run: |
+          Get-FileHash dist\NeglectBlackBox.exe, dist\NeglectBlackBox-Setup.exe -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)" } | Tee-Object -FilePath dist\SHA256SUMS.txt
+          Get-Content dist\SHA256SUMS.txt | Out-String | Add-Content $env:GITHUB_STEP_SUMMARY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: neglect-blackbox-${{ steps.ver.outputs.version }}
+          path: |
+            dist/NeglectBlackBox.exe
+            dist/NeglectBlackBox-Setup.exe
+            dist/SHA256SUMS.txt
+
+      - name: GitHub release (once per version)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="blackbox-v${{ steps.ver.outputs.version }}"
+          if gh release view "$tag" >/dev/null 2>&1; then echo "release $tag exists already (raise VERSION in reader.py for a new one)"; exit 0; fi
+          gh release create "$tag" dist/NeglectBlackBox-Setup.exe dist/NeglectBlackBox.exe dist/SHA256SUMS.txt --target "${{ github.sha }}" \
+            --title "Black Box reader ${{ steps.ver.outputs.version }}" \
+            --notes "Hidden VRChat log reader for staff PCs. Install NeglectBlackBox-Setup.exe. SHA-256 values are in SHA256SUMS.txt."
