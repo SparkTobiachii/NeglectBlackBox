@@ -19,6 +19,7 @@ Event = {"ts": unix seconds, "kind": str, "loc": location or "", "data": {...}}.
   vip_activate data: {}                                                                ([MyInstance] ActivateVipInstance)
   vip_purchase data: name                                                              (OnPurchaseConfirmed - but X ...)
   vip_guest    data: name, usr, on (bool)                                              (`Whitelist changed from 2|1,6|1 to 2|1`: the VIP guest list of Just B Club; entries are `<Photon actor number>|<flag>`)
+  announce     data: name, usr, text                                                   (`_Notification(Announcement by X, "text", RGBA(`: a text announcement in Just B Club, with its content; a text with line breaks arrives on several lines)
   video        data: url, by (who most likely started it: the last person who got the Video role in the 3 minutes before, may be "")  (`[Video Playback] Attempting to resolve URL '...'`: the log does not say WHO pressed play)
   suite        data: name, usr, room, text                                              (private room of Just B Club: `[Rooms] _EnterRoomParam(2)` = went in; the settings come as `_Notification(Intercom disabled, ...)`, `Invite icon enabled`, `Occupant names hidden`, `Suite Locked`)
   security     data: on (bool)                                                         ([Players] OnSecurityEnabledChanged(True))
@@ -43,6 +44,7 @@ RE_AVATAR = re.compile(r"\[Behaviour\] Switching (.+?) to avatar (.+?)\s*$")
 RE_MASTER = re.compile(r"\[Players\] UpdateInstanceMaster - newMaster = (.+?)\s*$")
 RE_ROLES_CALL = re.compile(r"\[players _UpdatePlayer\((.*), (\d+), (\d+), (.*?)\s*$")
 RE_ROLE = re.compile(r"\[Players\._UpdatePlayer\] (\w+) - prevOn = (True|False) - nextOn = (True|False), byPlayer = (.+?)\s*$")
+RE_ANNOUNCE = re.compile(r"_Notification\(Announcement by (.+?), \"(.*)\", RGBA\(", re.S)
 RE_VIDEO = re.compile(r"\[Video Playback\] Attempting to resolve URL '([^']+)'")
 RE_NOTIFY = re.compile(r"_Notification\((\w[\w ]* role), (Added|Removed) by (.+?), RGBA\(")
 RE_HOST = re.compile(r"\[MyInstance\] Setting Host to (.+?)\s*$")
@@ -131,6 +133,7 @@ class LogParser:
         self.dists: dict[str, float] = {}  # `_GetRoom dist from Bedroom N = x` lines since the last `Setting currentRoom`: the nearest room is the one
         self.video_giver: tuple[float, str, str] = (-999.0, "", "")  # (time, name, usr) of the last Video role that was really given
         self.last_video = ("", -999.0)
+        self.ann: tuple[float, str] | None = None  # an announcement whose text runs over several lines: (time, text so far)
         self.recent_roles: dict[tuple[str, str, bool], float] = {}  # (name, role, on) -> time of the role event, so the matching `_Notification` is not a second line
         self.last_ts = 0.0
         self.launch_args: list[str] = []  # how this VRChat was started (`Launching with args` + `Arg:` lines at the top of the log)
@@ -155,6 +158,7 @@ class LogParser:
         self.recent_roles.clear()
         self.video_giver = (-999.0, "", "")
         self.last_video = ("", -999.0)
+        self.ann = None
         self.suite_room = ""
         self.dists.clear()
 
@@ -170,7 +174,15 @@ class LogParser:
     def _feed(self, line: str) -> list[dict]:
         ts = parse_line_ts(line, self.tz)
         if ts is None:
+            if self.ann is not None:  # the rest of a multi-line announcement
+                at, text = self.ann
+                text += "\n" + line.rstrip("\r\n")
+                if "RGBA(" in line:
+                    self.ann = None
+                    return self._announce(at, text)
+                self.ann = (at, text) if len(text) < 2000 else None
             return []
+        self.ann = None  # a new log line: whatever was open is over
         self.last_ts = ts
         # the cheap pre-filter: most of the log is noise, and these checks are substring tests
         if "Launching with args" in line:
@@ -247,6 +259,11 @@ class LogParser:
                 self.suite_room = min(self.dists, key=lambda r: self.dists[r])
                 self.dists.clear()
         elif "_Notification(" in line:
+            if "_Notification(Announcement by " in line:
+                if "RGBA(" in line:
+                    return self._announce(ts, line)
+                self.ann = (ts, line)
+                return []
             sm = RE_SUITE_NOTE.search(line)
             if sm:
                 return [self._ev(ts, "suite", name=self.local_name, usr=self.local_usr, room=self.suite_room, text=(sm.group(1).strip() + (": " + sm.group(2).strip() if sm.group(1).startswith("Action denied") and sm.group(2).strip() else "")))]
@@ -362,6 +379,13 @@ class LogParser:
             self.reset_room()
             self.loc = ""
         return out
+
+    def _announce(self, ts: float, text: str) -> list[dict]:
+        m = RE_ANNOUNCE.search(text)
+        if not m:
+            return []
+        name = m.group(1).strip()
+        return [self._ev(ts, "announce", name=name, usr=self.present.get(name, self.local_usr if name == self.local_name else ""), text=m.group(2).strip()[:300])]
 
     def _split_avatar(self, tail: str) -> tuple[str, str]:
         """`[Behaviour] Switching <name> to avatar <avatar>`: a name or an avatar may itself contain " to avatar ", so a name we already know wins."""

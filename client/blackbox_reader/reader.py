@@ -45,7 +45,7 @@ except ImportError:  # started from another folder (tests, tools): the module si
     except ImportError:
         ui = None  # type: ignore[assignment]  # the window is optional (and only exists on Windows)
 
-VERSION = "0.4.4"
+VERSION = "0.4.5"
 UPDATE_PREFIXES = ("https://github.com/SparkTobiachii/NeglectBotDashboard/releases/download/", "https://github.com/SparkTobiachii/NeglectBot/releases/download/")
 UPDATE_PREFIX = UPDATE_PREFIXES[0]  # an update is only ever fetched from our own GitHub releases ...
 UPDATE_FROM_BOT = "bot"  # ... or from the bot itself (the repository is private: the bot serves the installer, signed like every other request)
