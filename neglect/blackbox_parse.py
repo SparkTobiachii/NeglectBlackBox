@@ -19,6 +19,7 @@ Event = {"ts": unix seconds, "kind": str, "loc": location or "", "data": {...}}.
   vip_activate data: {}                                                                ([MyInstance] ActivateVipInstance)
   vip_purchase data: name                                                              (OnPurchaseConfirmed - but X ...)
   vip_guest    data: name, usr, on (bool)                                              (`Whitelist changed from 2|1,6|1 to 2|1`: the VIP guest list of Just B Club; entries are `<Photon actor number>|<flag>`)
+  video        data: url, by (who most likely started it: the last person who got the Video role in the 3 minutes before, may be "")  (`[Video Playback] Attempting to resolve URL '...'`: the log does not say WHO pressed play)
   suite        data: name, usr, room, text                                              (private room of Just B Club: `[Rooms] _EnterRoomParam(2)` = went in; the settings come as `_Notification(Intercom disabled, ...)`, `Invite icon enabled`, `Occupant names hidden`, `Suite Locked`)
   security     data: on (bool)                                                         ([Players] OnSecurityEnabledChanged(True))
   avatar_load  data: avatar, author                                                   (`[AssetBundleDownloadManager] [n] Unpacking Avatar (Name by Author)`: an avatar was loaded, with its creator; no usr_ in the line)
@@ -42,6 +43,7 @@ RE_AVATAR = re.compile(r"\[Behaviour\] Switching (.+?) to avatar (.+?)\s*$")
 RE_MASTER = re.compile(r"\[Players\] UpdateInstanceMaster - newMaster = (.+?)\s*$")
 RE_ROLES_CALL = re.compile(r"\[players _UpdatePlayer\((.*), (\d+), (\d+), (.*?)\s*$")
 RE_ROLE = re.compile(r"\[Players\._UpdatePlayer\] (\w+) - prevOn = (True|False) - nextOn = (True|False), byPlayer = (.+?)\s*$")
+RE_VIDEO = re.compile(r"\[Video Playback\] Attempting to resolve URL '([^']+)'")
 RE_NOTIFY = re.compile(r"_Notification\((\w[\w ]* role), (Added|Removed) by (.+?), RGBA\(")
 RE_HOST = re.compile(r"\[MyInstance\] Setting Host to (.+?)\s*$")
 RE_VIPHOST = re.compile(r"\[MyInstance\] Setting VIPHost to (.+?)\s*$")
@@ -65,6 +67,7 @@ RE_CLOG = re.compile(r"\[Room\] (Bedroom(?: VIP)? \d+) OnDeserialization - IsClo
 # the roles the Just B Club world logs; a name nobody knows is still reported
 ROLES = ("Host", "Security", "Bartender", "Performer", "Video", "Access")
 TOGGLE_WINDOW = 4.0  # seconds a `_ToggleRole` line stays valid for the role lines that follow it
+VIDEO_WINDOW = 180.0  # seconds after somebody got the Video role in which a video start is put on that person
 STATE_WINDOW = 20.0  # seconds after a person arrives in which their role lines are the roles they already had, not a change
 
 
@@ -126,6 +129,8 @@ class LogParser:
         self.toggle: tuple[float, str] = (0.0, "")  # (time, who) of the last `_ToggleRole` line
         self.suite_room = ""  # the private room the person who wears this log is in ("Bedroom 2")
         self.dists: dict[str, float] = {}  # `_GetRoom dist from Bedroom N = x` lines since the last `Setting currentRoom`: the nearest room is the one
+        self.video_giver: tuple[float, str, str] = (-999.0, "", "")  # (time, name, usr) of the last Video role that was really given
+        self.last_video = ("", -999.0)
         self.recent_roles: dict[tuple[str, str, bool], float] = {}  # (name, role, on) -> time of the role event, so the matching `_Notification` is not a second line
         self.last_ts = 0.0
         self.launch_args: list[str] = []  # how this VRChat was started (`Launching with args` + `Arg:` lines at the top of the log)
@@ -148,6 +153,8 @@ class LogParser:
         self.cfg = None
         self.toggle = (0.0, "")
         self.recent_roles.clear()
+        self.video_giver = (-999.0, "", "")
+        self.last_video = ("", -999.0)
         self.suite_room = ""
         self.dists.clear()
 
@@ -195,6 +202,18 @@ class LogParser:
             return []
         if not self.in_room:
             return []
+        if "[Video Playback] Attempting" in line:
+            m = RE_VIDEO.search(line)
+            local_joined = self.joined_at.get(self.local_usr)
+            if not m or self.roster or (local_joined is not None and ts - local_joined <= STATE_WINDOW):
+                return []  # what was already playing when the log wearer arrived
+            url = re.sub(r"[?&]si=[^&]*", "", m.group(1))[:200]
+            if self.last_video[0] == url and ts - self.last_video[1] < 10:
+                return []
+            self.last_video = (url, ts)
+            at, name, _usr = self.video_giver
+            by = name if ts - at <= VIDEO_WINDOW else ""
+            return [self._ev(ts, "video", url=url, by=by)]
         if "UpdateInstanceMaster" in line:
             m = RE_MASTER.search(line)
             if m:
@@ -386,6 +405,8 @@ class LogParser:
         if ts - self.toggle[0] <= TOGGLE_WINDOW and self.toggle[1]:  # a `_ToggleRole` line right before it: somebody really pressed the button
             by, state = self.toggle[1], False if not self.roster else state
         self.recent_roles[(name, role, nxt)] = ts
+        if role == "Video" and nxt and not state:
+            self.video_giver = (ts, name, usr)
         ev = self._ev(ts, "role", usr=usr, name=name, role=role, on=nxt, by=by, state=state)
         if not usr and name != self.local_name:  # not joined yet: hold it back until the join line gives the usr_ ID
             self.pending_roles.setdefault(name, []).append(ev)
