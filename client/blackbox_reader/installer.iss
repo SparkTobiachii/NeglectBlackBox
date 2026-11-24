@@ -39,9 +39,11 @@ FinishedLabel=The logger starts with Windows. Press Ctrl+Shift+N to see what it 
 
 [Files]
 Source: "..\..\dist\NeglectBlackBox.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "VRChat-Debug.cmd"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{userprograms}\Neglect Black Box"; Filename: "{app}\NeglectBlackBox.exe"; Parameters: "show"
+Name: "{userprograms}\VRChat (Black Box)"; Filename: "{app}\VRChat-Debug.cmd"; IconFilename: "{app}\NeglectBlackBox.exe"
 
 [Registry]
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "NeglectBlackBox"; ValueData: """{app}\NeglectBlackBox.exe"" run"; Flags: uninsdeletevalue

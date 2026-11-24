@@ -222,6 +222,9 @@ class BlackBoxWindow:
         self.fancy = False
         self.canvas = None
         self.logo = None
+        self._x: int | None = None  # where the frameless window sits (None = centre it the first time); dragging changes it
+        self._y: int | None = None
+        self._drag: tuple[int, int] | None = None
 
     # -- called from other threads
     def request(self, what: str) -> None:
@@ -272,9 +275,11 @@ class BlackBoxWindow:
         try:
             self._build_canvas(tk)
             self.fancy = True
+            self._set_frameless(True)
         except Exception:
             log.warning("the drawn window failed, using the plain one", exc_info=True)
             self.fancy = False
+            self._set_frameless(False)
             try:
                 for child in self.root.winfo_children():
                     child.destroy()
@@ -282,6 +287,13 @@ class BlackBoxWindow:
                 log.debug("could not clear the window", exc_info=True)
             self.canvas = None
             self._build_plain(tk)
+
+    def _set_frameless(self, on: bool) -> None:
+        """The drawn window has no Windows title bar or frame (it brings its own round X and can be dragged anywhere); the plain fallback keeps the normal frame, so it can always be closed."""
+        try:
+            self.root.overrideredirect(bool(on))
+        except Exception:
+            log.debug("frame not changed", exc_info=True)
 
     def _build_canvas(self, tk) -> None:
         self.root.minsize(WIDTH, 0)
@@ -301,6 +313,8 @@ class BlackBoxWindow:
         self._canvas_h = 700
         canvas.bind("<ButtonPress-1>", self._on_press)
         canvas.bind("<ButtonRelease-1>", self._on_release)
+        canvas.bind("<B1-Motion>", self._on_drag)
+        canvas.bind("<Escape>", lambda _e: self.hide() or "break")
         canvas.bind("<FocusIn>", lambda _e: self._set_focus(True))
         canvas.bind("<FocusOut>", lambda _e: self._set_focus(False))
         canvas.bind("<Tab>", lambda _e: self._move_focus(1) or "break")
@@ -361,6 +375,31 @@ class BlackBoxWindow:
         c.tag_bind(f"btn{n}", "<Enter>", lambda _e, i=n: self._on_hover(i, True))
         c.tag_bind(f"btn{n}", "<Leave>", lambda _e, i=n: self._on_hover(i, False))
 
+    def _close_button(self, x1, y1, x2, y2, ring_on: bool) -> None:
+        """The round X in the top right corner (the window has no Windows frame): a dark disc with a thin cross that turns crimson under the mouse. It only hides the window."""
+        c, n = self.canvas, len(self._buttons)
+        body, hover = mix(BG_TOP, "#ffffff", 0.07), RED
+        shape = c.create_oval(x1, y1, x2, y2, fill=body, outline=LINE, tags=("ui", f"btn{n}"))
+        cx, cy, d = (x1 + x2) / 2, (y1 + y2) / 2, (x2 - x1) * 0.2
+        for a, b in (((-d, -d), (d, d)), ((-d, d), (d, -d))):
+            c.create_line(cx + a[0], cy + a[1], cx + b[0], cy + b[1], fill=TEXT, width=2, capstyle="round", tags=("ui", f"btn{n}"))
+        if ring_on:
+            c.create_oval(x1 - 3, y1 - 3, x2 + 3, y2 + 3, fill="", outline=GOLD, width=2, tags="ui")
+        self._buttons.append({"cmd": self.hide, "box": (x1, y1, x2, y2), "shape": shape, "colours": (body, hover)})
+        c.tag_bind(f"btn{n}", "<Enter>", lambda _e, i=n: self._on_hover(i, True))
+        c.tag_bind(f"btn{n}", "<Leave>", lambda _e, i=n: self._on_hover(i, False))
+
+    def _on_drag(self, event) -> None:
+        """Move the frameless window while the mouse button is held on an empty spot of it."""
+        if self._drag is None:
+            return
+        try:
+            self._x = int(getattr(event, "x_root", 0) - self._drag[0])
+            self._y = int(getattr(event, "y_root", 0) - self._drag[1])
+            self.root.geometry(f"+{self._x}+{self._y}")
+        except Exception:
+            log.debug("window not moved", exc_info=True)
+
     def _on_hover(self, i: int, inside: bool) -> None:
         self._hover = i if inside else None
         info = self._buttons[i]
@@ -376,7 +415,11 @@ class BlackBoxWindow:
 
     def _on_press(self, event) -> None:
         i = self._button_at(getattr(event, "x", -1), getattr(event, "y", -1))
-        if i is None:
+        if i is None:  # an empty spot: this is where the window is picked up and dragged
+            try:
+                self._drag = (int(getattr(event, "x_root", 0) - self.root.winfo_x()), int(getattr(event, "y_root", 0) - self.root.winfo_y()))
+            except Exception:
+                self._drag = None
             return
         self._pressed = i
         self.canvas.move(f"btn{i}", 0, 2)
@@ -384,6 +427,7 @@ class BlackBoxWindow:
 
     def _on_release(self, event) -> None:
         """One handler for the whole canvas, so a release anywhere (also outside the window) always puts the button back; it is a click only when it ends on the same button."""
+        self._drag = None
         i, self._pressed = self._pressed, None
         if i is None:
             return
@@ -418,12 +462,13 @@ class BlackBoxWindow:
         H = self._canvas_h  # what the background was made for; if the content ends up taller or shorter, the second pass below redraws with the right size
         tones = {"ok": GREEN, "warn": AMBER, "bad": RED2, "plain": MUTED}
         y = 28
+        c.create_rectangle(0, 0, W - 1, H - 1, outline=mix(LINE, RED, 0.3), fill="", tags="ui")  # a hairline: without the Windows frame it keeps the edge clean against the desktop
         if self.logo is not None:
             c.create_image(pad, y, image=self.logo, anchor="nw", tags="ui")
         tx = pad + (102 if self.logo is not None else 0)
         c.create_text(tx, y + 8, text="N E G L E C T", anchor="nw", fill=TEXT, font=(SERIF, 25, "bold"), tags="ui")
         c.create_text(tx, y + 50, text="Black Box  ·  VRChat log reader", anchor="nw", fill=GOLD, font=(SANS, 11), tags="ui")
-        self._pill(W - pad - 66, y + 2, 66, 26, f"v{self.version}")
+        self._pill(W - pad - 66 - 18, y + 2, 66, 26, f"v{self.version}")  # left of the round X
         y += 84 + 20
         c.create_line(pad, y, W - pad, y, fill=mix(RED, "#000000", 0.25), width=3, tags="ui")
         c.create_line(pad, y, W - pad, y, fill=RED2, width=1, tags="ui")
@@ -481,10 +526,11 @@ class BlackBoxWindow:
         else:
             self._round_button(pad, y, W - pad, y + 44, "Check for updates", self.control.ask_for_updates, False, focus == 1)
         y += 44 + 22
+        self._close_button(W - 16 - 24, 14, W - 16, 38, focus == len(self._buttons))  # drawn last: it is the last stop of the Tab key
 
         # -- the footer
         key = hotkey_label(self.control.hotkey)
-        hint = (f"{key} shows or hides this window. The X only hides it: the logger keeps running." if self.hotkey_ok
+        hint = (f"{key} shows or hides this window. The X only hides it: the logger keeps running. Drag the window by an empty spot." if self.hotkey_ok
                 else f"{key} is used by another program. Open this window with the Neglect Black Box entry in the Start menu.")
         hh = self._text_height(hint, (SANS, 9), W - 2 * pad - 130)
         c.create_text(pad, y, text=hint, anchor="nw", fill=MUTED, font=(SANS, 9), width=W - 2 * pad - 130, tags="ui")
@@ -616,6 +662,18 @@ class BlackBoxWindow:
             self.control.quit.set()
             self.root.destroy()
 
+    def _geometry(self, height: int) -> str:
+        """Size, and for the frameless window also the place: the first time it is centred on the screen (a little above the middle), later it stays where it was dragged to."""
+        if not self.fancy:
+            return f"{WIDTH}x{height}"
+        if self._x is None or self._y is None:
+            try:
+                self._x = max(0, (int(self.root.winfo_screenwidth()) - WIDTH) // 2)
+                self._y = max(0, (int(self.root.winfo_screenheight()) - height) // 2 - 40)
+            except Exception:
+                self._x, self._y = 100, 100
+        return f"{WIDTH}x{height}+{self._x}+{self._y}"
+
     def _fit(self) -> None:
         """Size the window to its content (the width is fixed): a new row or a longer sentence can never push a button or the hint out of sight."""
         try:
@@ -623,7 +681,7 @@ class BlackBoxWindow:
             height = int(self._canvas_h) if self.fancy else int(self.root.winfo_reqheight())
             if height != getattr(self, "_height", 0):
                 self._height = height
-                self.root.geometry(f"{WIDTH}x{height}")
+                self.root.geometry(self._geometry(height))
         except Exception:
             log.debug("window not resized", exc_info=True)
 
@@ -672,7 +730,14 @@ class BlackBoxWindow:
                     except Exception:
                         log.debug("canvas not removed", exc_info=True)
                     self.canvas = None
+                    try:  # a frame can only be switched while the window is hidden
+                        self.root.withdraw()
+                        self._set_frameless(False)
+                        self.root.deiconify()
+                    except Exception:
+                        log.debug("frame not restored", exc_info=True)
                     self._build_plain(self.tk)
+                    self._height = 0  # the plain window needs its own size
                     self._refresh_plain(snap)
         else:
             self._refresh_plain(snap)
@@ -719,7 +784,7 @@ class _DemoControl:
     """Stands in for the reader's Control: the same attributes, with a few made-up states that change every few seconds."""
 
     STATES: ClassVar[list[dict]] = [
-        {"server": "ok", "status": "approved", "linked": True, "room": "Just B Club 4.0", "tracked": True, "sent": 305, "ids_allowed": True, "avatar_ids": True, "newest": "0.5.1", "message": "You have the newest version (0.5.1)"},
+        {"server": "ok", "status": "approved", "linked": True, "room": "Just B Club 4.0", "tracked": True, "sent": 305, "ids_allowed": True, "avatar_ids": True, "newest": "0.5.2", "message": "You have the newest version (0.5.2)"},
         {"server": "ok", "status": "approved", "linked": True, "vrchat": False, "sent": 0},
         {"server": "ok", "status": "approved", "linked": True, "room": "My home", "tracked": False, "sent": 12, "ids_allowed": True, "avatar_ids": False},
         {"paused": True, "server": "ok", "status": "approved", "linked": True, "sent": 40},
@@ -740,7 +805,7 @@ class _DemoControl:
         import time
 
         state = dict(self.STATES[int(time.time() // 5) % len(self.STATES)])
-        state.setdefault("version", "0.5.1")
+        state.setdefault("version", "0.5.2")
         state["paused"] = state.get("paused") or self.paused
         state["avatar_ids"] = self.avatar_ids if state.get("ids_allowed") else state.get("avatar_ids", False)
         return state
@@ -757,4 +822,4 @@ class _DemoControl:
 
 if __name__ == "__main__":  # pragma: no cover - needs a screen
     logging.basicConfig(level=logging.INFO)
-    BlackBoxWindow(_DemoControl(), "0.5.1").run(show=True, threads=False)
+    BlackBoxWindow(_DemoControl(), "0.5.2").run(show=True, threads=False)
