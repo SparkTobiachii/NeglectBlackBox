@@ -21,6 +21,8 @@ Event = {"ts": unix seconds, "kind": str, "loc": location or "", "data": {...}}.
   vip_guest    data: name, usr, on (bool)                                              (`Whitelist changed from 2|1,6|1 to 2|1`: the VIP guest list of Just B Club; entries are `<Photon actor number>|<flag>`)
   announce     data: name, usr, text                                                   (`_Notification(Announcement by X, "text", RGBA(`: a text announcement in Just B Club, with its content; a text with line breaks arrives on several lines)
   video        data: url, by (who most likely started it: the last person who got the Video role in the 3 minutes before, may be "")  (`[Video Playback] Attempting to resolve URL '...'`: the log does not say WHO pressed play)
+  item         data: name, usr, item (the person who spawned a world object / prop; `[VRCItems] Item prop_... spawned by usr_...`, the name is looked up from the people in the room)
+  votekick     data: name, usr, by, by_usr (a vote kick was started against `name` by `by`; `A vote kick has been initiated against X by Y, do you agree?`)
   suite        data: name, usr, room, text                                              (private room of Just B Club: `[Rooms] _EnterRoomParam(2)` = went in; the settings come as `_Notification(Intercom disabled, ...)`, `Invite icon enabled`, `Occupant names hidden`, `Suite Locked`)
   security     data: on (bool)                                                         ([Players] OnSecurityEnabledChanged(True))
   avatar_load  data: avatar, author                                                   (`[AssetBundleDownloadManager] [n] Unpacking Avatar (Name by Author)`: an avatar was loaded, with its creator; no usr_ in the line)
@@ -51,6 +53,8 @@ RE_MASTER = re.compile(r"\[Players\] UpdateInstanceMaster - newMaster = (.+?)\s*
 RE_ROLES_CALL = re.compile(r"\[players _UpdatePlayer\((.*), (\d+), (\d+), (.*?)\s*$")
 RE_ROLE = re.compile(r"\[Players\._UpdatePlayer\] (\w+) - prevOn = (True|False) - nextOn = (True|False), byPlayer = (.+?)\s*$")
 RE_ANNOUNCE = re.compile(r"_Notification\(Announcement by (.+?), \"(.*)\", RGBA\(", re.S)
+RE_ITEM = re.compile(r"\[VRCItems\] Item\s+(\S+)\s+spawned by\s+" + USR)
+RE_VOTEKICK = re.compile(r"A vote kick has been initiated against\s+(.+?)\s*,\s*do you agree\?", re.S)
 RE_VIDEO = re.compile(r"\[Video Playback\] Attempting to resolve URL '([^']+)'")
 RE_NOTIFY = re.compile(r"_Notification\((\w[\w ]* role), (Added|Removed) by (.+?), RGBA\(")
 RE_HOST = re.compile(r"\[MyInstance\] Setting Host to (.+?)\s*$")
@@ -141,6 +145,9 @@ class LogParser:
         self.video_giver: tuple[float, str, str] = (-999.0, "", "")  # (time, name, usr) of the last Video role that was really given
         self.last_video = ("", -999.0)
         self.ann: tuple[float, str] | None = None  # an announcement whose text runs over several lines: (time, text so far)
+        self.cont: tuple[float, str, str] | None = None  # an item / vote kick line that runs over several lines: (time, kind, text so far)
+        self.last_item = ("", -999.0)  # (usr + item, time): the same person spawning the same thing within a second is one line
+        self.last_vote = ("", -999.0)
         self.recent_roles: dict[tuple[str, str, bool], float] = {}  # (name, role, on) -> time of the role event, so the matching `_Notification` is not a second line
         self.last_ts = 0.0
         self.launch_args: list[str] = []  # how this VRChat was started (`Launching with args` + `Arg:` lines at the top of the log)
@@ -166,6 +173,9 @@ class LogParser:
         self.video_giver = (-999.0, "", "")
         self.last_video = ("", -999.0)
         self.ann = None
+        self.cont = None
+        self.last_item = ("", -999.0)
+        self.last_vote = ("", -999.0)
         self.suite_room = ""
         self.dists.clear()
 
@@ -188,8 +198,15 @@ class LogParser:
                     self.ann = None
                     return self._announce(at, text)
                 self.ann = (at, text) if len(text) < 2000 else None
+            elif self.cont is not None and line.strip():  # the rest of an item / vote kick line that was wrapped
+                at, kind, text = self.cont
+                text += " " + line.strip()
+                out = self._item(at, text) if kind == "item" else self._votekick(at, text)
+                self.cont = None if out or len(text) > 600 else (at, kind, text)
+                return out
             return []
         self.ann = None  # a new log line: whatever was open is over
+        self.cont = None
         self.last_ts = ts
         # the cheap pre-filter: most of the log is noise, and these checks are substring tests
         if "Launching with args" in line:
@@ -199,6 +216,20 @@ class LogParser:
             m = RE_ARG.search(line)
             if m:
                 self.launch_args.append(m.group(1))
+            return []
+        if "vote kick has been initiated" in line:  # the exact prefix of these two lines is not known: look for the sentence itself, before the other dispatch
+            if not self.in_room:
+                return []
+            if RE_VOTEKICK.search(" ".join(line.split())):
+                return self._votekick(ts, line)
+            self.cont = (ts, "votekick", line.strip())  # the sentence continues on the next line
+            return []
+        if "[VRCItems]" in line and "Item" in line:
+            if not self.in_room:
+                return []
+            if RE_ITEM.search(" ".join(line.split())):
+                return self._item(ts, line)
+            self.cont = (ts, "item", line.strip())
             return []
         if "[Behaviour]" in line:
             return self._behaviour(ts, line)
@@ -389,6 +420,39 @@ class LogParser:
             self.reset_room()
             self.loc = ""
         return out
+
+    def _usr_name(self, usr: str) -> str:
+        for name, u in self.present.items():
+            if u == usr:
+                return name
+        return self.local_name if usr and usr == self.local_usr else ""
+
+    def _item(self, ts: float, text: str) -> list[dict]:
+        """`[VRCItems] Item prop_... spawned by usr_...`: somebody spawned an object."""
+        m = RE_ITEM.search(" ".join(text.split()))
+        if not m:
+            return []
+        item, usr = m.group(1)[:80], m.group(2)
+        key = usr + "|" + item
+        if self.last_item[0] == key and ts - self.last_item[1] < 1.0:
+            return []
+        self.last_item = (key, ts)
+        return [self._ev(ts, "item", name=self._usr_name(usr), usr=usr, item=item)]
+
+    def _votekick(self, ts: float, text: str) -> list[dict]:
+        """`A vote kick has been initiated against X by Y, do you agree?`: the initiator is after the LAST " by " (a name may contain the word)."""
+        m = RE_VOTEKICK.search(" ".join(text.split()))
+        if not m:
+            return []
+        target, _, by = m.group(1).rpartition(" by ")
+        target, by = target.strip(), by.strip()
+        if not target or not by:
+            return []
+        if self.last_vote[0] == target + "|" + by and ts - self.last_vote[1] < 10:
+            return []
+        self.last_vote = (target + "|" + by, ts)
+        usr_of = lambda n: self.present.get(n, self.local_usr if n and n == self.local_name else "")
+        return [self._ev(ts, "votekick", name=target[:80], usr=usr_of(target), by=by[:80], by_usr=usr_of(by))]
 
     def _announce(self, ts: float, text: str) -> list[dict]:
         m = RE_ANNOUNCE.search(text)
