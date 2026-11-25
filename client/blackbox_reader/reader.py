@@ -19,6 +19,7 @@ import logging
 import os
 import platform
 import secrets
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -46,7 +47,7 @@ except ImportError:  # started from another folder (tests, tools): the module si
     except ImportError:
         ui = None  # type: ignore[assignment]  # the window is optional (and only exists on Windows)
 
-VERSION = "0.5.4"
+VERSION = "0.5.5"
 UPDATE_PREFIXES = ("https://github.com/SparkTobiachii/NeglectBotDashboard/releases/download/", "https://github.com/SparkTobiachii/NeglectBot/releases/download/", "https://github.com/SparkTobiachii/NeglectBlackBox/releases/download/")
 UPDATE_PREFIX = UPDATE_PREFIXES[0]  # an update is only ever fetched from our own GitHub releases ...
 UPDATE_FROM_BOT = "bot"  # ... or from the bot itself (the repository is private: the bot serves the installer, signed like every other request)
@@ -60,6 +61,30 @@ IDS_WINDOW = 120.0  # seconds after a room change in which the list of avatar ID
 IDS_MAX_FILE = 16 * 1024 * 1024  # a bigger analytics file is not read at all (the real one is small)
 IDS_RETRY_MAX = 400
 log = logging.getLogger("blackbox")
+
+
+def _tls_context() -> ssl.SSLContext:
+    """HTTPS trust without the Windows *intermediate* store: Python loads Windows' "CA" store as trusted, and an old cached cross-signed
+    intermediate in there (e.g. ISRG Root X2 signed by X1, expired 2025-09) makes OpenSSL build its chain through it and fail with
+    "certificate has expired" although the server's chain is valid. So: Mozilla's roots (certifi, bundled) plus the Windows *root* store only
+    (that keeps roots a company or an antivirus added)."""
+    try:
+        import certifi
+
+        ctx = ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
+    if sys.platform == "win32":
+        for der, enc, trust in ssl.enum_certificates("ROOT"):  # type: ignore[attr-defined]
+            if enc == "x509_asn" and (trust is True or "1.3.6.1.5.5.7.3.1" in trust):  # trusted for server authentication
+                try:
+                    ctx.load_verify_locations(cadata=der)
+                except ssl.SSLError:
+                    pass
+    return ctx
+
+
+TLS = _tls_context()
 
 
 # ---------------------------------------------------------------- where things live
@@ -214,7 +239,7 @@ class Api:
             raise ApiError(0, "the server address must be https")
         req = urllib.request.Request(self.id.cfg["server"] + path, data=raw, headers=headers, method="POST")  # noqa: S310  # nosec B310 - https only (checked above)
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310  # nosec B310
+            with urllib.request.urlopen(req, timeout=timeout, context=TLS) as resp:  # noqa: S310  # nosec B310
                 return json.loads(resp.read() or b"{}")
         except urllib.error.HTTPError as e:
             detail = ""
@@ -236,7 +261,7 @@ class Api:
                    "X-BB-Sig": base64.b64encode(self.key.sign(msg).signature).decode()}
         req = urllib.request.Request(self.id.cfg["server"] + path, headers=headers, method="GET")  # noqa: S310  # nosec B310 - https only (checked above)
         try:
-            with urllib.request.urlopen(req, timeout=120) as resp, open(target, "wb") as out:  # noqa: S310  # nosec B310
+            with urllib.request.urlopen(req, timeout=120, context=TLS) as resp, open(target, "wb") as out:  # noqa: S310  # nosec B310
                 size = 0
                 while chunk := resp.read(1 << 20):
                     size += len(chunk)
@@ -551,7 +576,7 @@ def download_update(latest: dict, folder: Path, api: Api | None = None) -> Path 
             return None
     else:
         req = urllib.request.Request(latest["url"], headers={"User-Agent": f"NeglectBlackBox/{VERSION}"})  # noqa: S310  # nosec B310 - https GitHub release (update_wanted)
-        with urllib.request.urlopen(req, timeout=120) as resp, open(target, "wb") as out:  # noqa: S310  # nosec B310
+        with urllib.request.urlopen(req, timeout=120, context=TLS) as resp, open(target, "wb") as out:  # noqa: S310  # nosec B310
             if not resp.geturl().startswith("https://"):
                 return None
             size = 0
@@ -616,6 +641,11 @@ def vrchat_running() -> bool:
 def first_start(identity: Identity, open_browser=webbrowser.open) -> None:
     """No key yet: create it, ask the bot to list this PC, and open the Discord login once (it proves who sits at this PC)."""
     identity.create(DEFAULT_SERVER)
+    register(identity, open_browser)
+
+
+def register(identity: Identity, open_browser=webbrowser.open) -> None:
+    """Ask the bot to list this PC and open the Discord login. Also used when the bot does not know the key (the first start could not reach it)."""
     Api(identity).register(platform.node() or "PC")
     open_browser(identity.link_url())
 
@@ -631,6 +661,14 @@ def check_in(api: Api, identity: Identity, reader: Reader, state: dict, folder: 
     try:
         answer = api.hello(reader.loc, reader.parser.debug_on)
     except ApiError as e:
+        if e.status == 401 and e.detail == "unknown device":  # the first start never reached the bot: list this PC now and open the Discord login
+            try:
+                register(identity, open_browser)
+                state["opened"] = True
+                log.info("this PC was not known to the bot: registered it now")
+                return note("This PC was registered: finish the Discord login in your browser", server="ok", linked=False)
+            except Exception as e2:
+                log.info("registering failed: %s", e2)
         if e.status in (401, 403):
             log.info("the bot refuses this PC: %s", e.detail)
         return note(f"The bot refused this PC: {e.detail or e.status}", server="refused")
@@ -812,9 +850,10 @@ def _main(argv: list[str], folder: Path) -> int:
         try:
             first_start(identity)
             opened = True
-        except Exception:
+        except Exception:  # the key exists now: the loop registers it as soon as the bot can be reached (check_in, "unknown device")
             log.warning("first start failed", exc_info=True)
-            return 2
+            if not identity.ready:
+                return 2
     control = Control(folder)
     if not windowed or ui is None:
         run_loop(identity, opened, control)
