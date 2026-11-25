@@ -25,7 +25,7 @@ jobs:
           python-version: "3.13"
 
       - name: Install build tools
-        run: python -m pip install --upgrade pip pyinstaller pynacl
+        run: python -m pip install --upgrade pip pyinstaller pynacl certifi
 
       - name: Read the version
         id: ver
@@ -43,7 +43,7 @@ jobs:
           --add-data "client/blackbox_reader/assets;assets"
           --paths neglect --paths client/blackbox_reader --hidden-import blackbox_parse --hidden-import bb_window
           --hidden-import tkinter --hidden-import tkinter.messagebox
-          --hidden-import _cffi_backend --collect-all nacl
+          --hidden-import _cffi_backend --collect-all nacl --collect-data certifi --hidden-import certifi
           client/blackbox_reader/reader.py
 
       - name: Self test of the finished exe
